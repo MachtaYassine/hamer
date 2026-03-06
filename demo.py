@@ -150,6 +150,8 @@ def main():
     parser.add_argument('--gvhmr_bboxes', type=str, default='', help='Path to GVHMR bbx.pt file — skip ViTDet, use GVHMR person bboxes')
     parser.add_argument('--focal_length', type=float, default=0,
                         help='Override focal length for cam_t_full (0=use default HaMeR focal)')
+    parser.add_argument('--vitpose_cache', type=str, default='',
+                        help='Path to cached wholebody_vitpose.pt (F,133,3) — skip ViTPose')
 
     args = parser.parse_args()
 
@@ -185,8 +187,14 @@ def main():
     else:
         print(f"  [Skip] Body detector not loaded (using GVHMR bboxes)")
 
-    # keypoint detector
-    cpm = ViTPoseModel(device)
+    # keypoint detector (skip if using cached wholebody keypoints)
+    cpm = None
+    vitpose_cache = None
+    if args.vitpose_cache:
+        vitpose_cache = torch.load(args.vitpose_cache, map_location='cpu', weights_only=False)
+        print(f"  [Skip] ViTPose model not loaded (using cache: {vitpose_cache.shape})")
+    else:
+        cpm = ViTPoseModel(device)
 
     # Setup the renderer
     renderer = Renderer(model_cfg, faces=model.mano.faces)
@@ -252,17 +260,25 @@ def main():
                 chunk_det_bboxes.append(np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1))
 
         # Per-image: keypoint detection + hand bbox extraction + crop creation
-        for img_cv2, img_path, det_bboxes_scores in zip(chunk_images, chunk_paths, chunk_det_bboxes):
+        for ci, (img_cv2, img_path, det_bboxes_scores) in enumerate(zip(chunk_images, chunk_paths, chunk_det_bboxes)):
             img = img_cv2.copy()[:, :, ::-1]
 
             if len(det_bboxes_scores) == 0:
                 continue
 
             # Detect human keypoints for each person
-            vitposes_out = cpm.predict_pose(
-                img,
-                [det_bboxes_scores],
-            )
+            if vitpose_cache is not None:
+                frame_idx = chunk_start + ci
+                if frame_idx < len(vitpose_cache):
+                    cached_kps = vitpose_cache[frame_idx].numpy()  # (133, 3)
+                    vitposes_out = [{'keypoints': cached_kps}]
+                else:
+                    vitposes_out = []
+            else:
+                vitposes_out = cpm.predict_pose(
+                    img,
+                    [det_bboxes_scores],
+                )
 
             bboxes = []
             is_right = []
