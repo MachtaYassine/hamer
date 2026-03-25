@@ -2,23 +2,14 @@ from pathlib import Path
 import torch
 import argparse
 import os
+import io
 import cv2
 import numpy as np
-from collections import defaultdict
 
 from hamer.configs import CACHE_DIR_HAMER
-from hamer.models import HAMER, download_models, load_hamer, DEFAULT_CHECKPOINT
+from hamer.models import download_models, load_hamer, DEFAULT_CHECKPOINT
 from hamer.utils import recursive_to
-from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
-from hamer.utils.renderer import Renderer, cam_crop_to_full
-import detectron2.data.transforms as T
-
-LIGHT_BLUE=(0.65098039,  0.74117647,  0.85882353)
-
-from vitpose_model import ViTPoseModel
-
-import json
-from typing import Dict, Optional
+from hamer.datasets.vitdet_dataset import ViTDetDataset
 
 try:
     from tqdm import tqdm
@@ -28,7 +19,6 @@ except ImportError:
 
 
 class _ListDataset(torch.utils.data.Dataset):
-    """Wrap a list of dicts as a Dataset for DataLoader batching."""
     def __init__(self, items):
         self.items = items
     def __len__(self):
@@ -38,294 +28,179 @@ class _ListDataset(torch.utils.data.Dataset):
 
 
 def auto_find_batch_size(model, sample_item, device, target_util=0.85):
-    """Probe GPU memory with a small test batch to find optimal batch size."""
+    """Two-probe GPU memory estimation: bs=1 (fixed overhead) then bs=4 (marginal cost)."""
+    import gc
+    gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
-    baseline = torch.cuda.memory_allocated(device)
-
-    # Test with a small batch to measure per-sample cost
-    test_bs = 2
-    loader = torch.utils.data.DataLoader(
-        _ListDataset([sample_item] * test_bs), batch_size=test_bs
-    )
-    batch = next(iter(loader))
-    batch = recursive_to(batch, device)
+    loader1 = torch.utils.data.DataLoader(_ListDataset([sample_item]), batch_size=1)
+    batch1 = recursive_to(next(iter(loader1)), device)
     with torch.no_grad():
-        _ = model(batch)
+        _ = model(batch1)
+    peak1 = torch.cuda.max_memory_allocated(device)
+    del batch1, _, loader1
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
 
-    peak = torch.cuda.max_memory_allocated(device)
-    per_sample = (peak - baseline) / test_bs
-
-    del batch, _
+    test_bs = 4
+    loader4 = torch.utils.data.DataLoader(_ListDataset([sample_item] * test_bs), batch_size=test_bs)
+    batch4 = recursive_to(next(iter(loader4)), device)
+    with torch.no_grad():
+        _ = model(batch4)
+    peak4 = torch.cuda.max_memory_allocated(device)
+    per_sample = (peak4 - peak1) / (test_bs - 1)
+    del batch4, _, loader4
     torch.cuda.empty_cache()
 
     total = torch.cuda.get_device_properties(device).total_memory
-    available = total * target_util - baseline
-    optimal = int(available / max(per_sample, 1))
-    optimal = max(1, min(optimal, 512))
+    if total < 12e9:
+        target_util = 0.65
+    available = total * target_util - peak1
+    optimal = max(1, min(256, int(available / max(per_sample, 1))))
+    if total < 12e9:
+        optimal = max(1, optimal // 2)
 
-    print(f"  [Auto BS] GPU: {total/1e9:.1f}GB total, model: {baseline/1e9:.1f}GB, "
+    print(f"  [Auto BS] GPU: {total/1e9:.1f}GB total, fixed: {peak1/1e6:.0f}MB, "
           f"per_sample: {per_sample/1e6:.0f}MB -> batch_size={optimal}")
     return optimal
 
 
-def _preprocess_for_detector(detector, img_cv2):
-    """Preprocess a single image for the detectron2 detector."""
-    original_image = img_cv2
-    if detector.input_format == "RGB":
-        original_image = original_image[:, :, ::-1]
-    height, width = original_image.shape[:2]
-    image = detector.aug(T.AugInput(original_image)).apply_image(original_image)
-    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-    return {"image": image, "height": height, "width": width}
-
-
-def _auto_det_batch_size(detector, sample_img_cv2, fp16=True, target_util=0.85):
-    """Probe GPU to find optimal batch size for body detector."""
-    device = next(detector.model.parameters()).device
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-    baseline = torch.cuda.memory_allocated(device)
-
-    test_bs = 2
-    inputs = [_preprocess_for_detector(detector, sample_img_cv2) for _ in range(test_bs)]
-    with torch.no_grad():
-        if fp16 and torch.cuda.is_available():
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                _ = detector.model(inputs)
-        else:
-            _ = detector.model(inputs)
-    peak = torch.cuda.max_memory_allocated(device)
-    per_sample = (peak - baseline) / test_bs
-    del inputs, _
-    torch.cuda.empty_cache()
-
-    total = torch.cuda.get_device_properties(device).total_memory
-    available = total * target_util - baseline
-    optimal = max(1, min(128, int(available / max(per_sample, 1))))
-    print(f"  [Auto BS] ViTDet: {total/1e9:.1f}GB GPU, {per_sample/1e6:.0f}MB/sample -> det_batch_size={optimal}")
-    return optimal
-
-
-def _batch_body_detect(detector, images_cv2, det_batch_size=4, fp16=True):
-    """Run body detection on multiple images in batches.
-
-    Returns list of prediction dicts, one per image.
-    """
-    all_preds = []
-    for i in range(0, len(images_cv2), det_batch_size):
-        batch_imgs = images_cv2[i:i+det_batch_size]
-        inputs = [_preprocess_for_detector(detector, img) for img in batch_imgs]
-
-        with torch.no_grad():
-            if fp16 and torch.cuda.is_available():
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    preds = detector.model(inputs)
-            else:
-                preds = detector.model(inputs)
-        all_preds.extend(preds)
-    return all_preds
-
-
 def main():
-    parser = argparse.ArgumentParser(description='HaMeR demo code')
-    parser.add_argument('--checkpoint', type=str, default=DEFAULT_CHECKPOINT, help='Path to pretrained model checkpoint')
-    parser.add_argument('--img_folder', type=str, default='images', help='Folder with input images')
-    parser.add_argument('--out_folder', type=str, default='out_demo', help='Output folder to save rendered results')
-    parser.add_argument('--side_view', dest='side_view', action='store_true', default=False, help='If set, render side view also')
-    parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=True, help='If set, render all people together also')
-    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
-    parser.add_argument('--batch_size', type=int, default=48, help='Batch size for HaMeR inference')
-    parser.add_argument('--rescale_factor', type=float, default=2.0, help='Factor for padding the bbox')
-    parser.add_argument('--body_detector', type=str, default='vitdet', choices=['vitdet', 'regnety'], help='Using regnety improves runtime and reduces memory')
-    parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
-    parser.add_argument('--save_params', dest='save_params', action='store_true', default=False, help='If set, save MANO params per frame as NPZ')
-    parser.add_argument('--no_render', action='store_true', default=False, help='Skip rendering (much faster, only save params/meshes)')
-    parser.add_argument('--auto_batch_size', action='store_true', default=True, help='Auto-detect optimal batch size from GPU VRAM')
-    parser.add_argument('--no_auto_batch_size', action='store_false', dest='auto_batch_size', help='Disable auto batch size')
-    parser.add_argument('--det_batch_size', type=int, default=8, help='Batch size for body detector (ViTDet/RegNetY)')
-    parser.add_argument('--fp16', action='store_true', default=True, help='Use FP16 for detection (faster)')
-    parser.add_argument('--no_fp16', action='store_false', dest='fp16', help='Disable FP16')
-    parser.add_argument('--gvhmr_bboxes', type=str, default='', help='Path to GVHMR bbx.pt file — skip ViTDet, use GVHMR person bboxes')
+    parser = argparse.ArgumentParser(description='HaMeR hand mesh recovery')
+    parser.add_argument('--checkpoint', type=str, default=DEFAULT_CHECKPOINT)
+    parser.add_argument('--img_folder', type=str, default='images')
+    parser.add_argument('--out_folder', type=str, default='out_demo')
+    parser.add_argument('--batch_size', type=int, default=48)
+    parser.add_argument('--rescale_factor', type=float, default=2.0)
+    parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'])
+    parser.add_argument('--auto_batch_size', action='store_true', default=True)
+    parser.add_argument('--no_auto_batch_size', action='store_false', dest='auto_batch_size')
     parser.add_argument('--focal_length', type=float, default=0,
                         help='Override focal length for cam_t_full (0=use default HaMeR focal)')
-    parser.add_argument('--vitpose_cache', type=str, default='',
-                        help='Path to cached wholebody_vitpose.pt (F,133,3) — skip ViTPose')
+    parser.add_argument('--video', type=str, default='',
+                        help='Read frames from video directly (skip frame extraction to disk)')
 
     args = parser.parse_args()
 
-    # Download and load checkpoints
+    # Buffered torch.load: one bulk read then deserialize from RAM.
+    _torch_load_orig = torch.load
+    def _torch_load_buffered(f, *a, **kw):
+        kw.setdefault("weights_only", False)
+        if isinstance(f, (str, Path)):
+            with open(f, "rb") as fh:
+                return _torch_load_orig(io.BytesIO(fh.read()), *a, **kw)
+        return _torch_load_orig(f, *a, **kw)
+    torch.load = _torch_load_buffered
+
     download_models(CACHE_DIR_HAMER)
-    model, model_cfg = load_hamer(args.checkpoint)
-
-    # Setup HaMeR model
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    model = model.to(device)
-    model.eval()
 
-    # Load detector (skip if using GVHMR bboxes)
-    detector = None
-    if not args.gvhmr_bboxes:
-        from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
-        if args.body_detector == 'vitdet':
-            from detectron2.config import LazyConfig
-            import hamer
-            cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
-            detectron2_cfg = LazyConfig.load(str(cfg_path))
-            detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
-            for i in range(3):
-                detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
-            detector = DefaultPredictor_Lazy(detectron2_cfg)
-        elif args.body_detector == 'regnety':
-            from detectron2 import model_zoo
-            from detectron2.config import get_cfg
-            detectron2_cfg = model_zoo.get_config('new_baselines/mask_rcnn_regnety_4gf_dds_FPN_400ep_LSJ.py', trained=True)
-            detectron2_cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
-            detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh   = 0.4
-            detector       = DefaultPredictor_Lazy(detectron2_cfg)
+    # On small GPUs (<12GB), defer HaMeR loading until after ViTPose finishes
+    small_gpu = torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 12e9
+    model = None
+    model_cfg = None
+    if not small_gpu:
+        model, model_cfg = load_hamer(args.checkpoint)
+        model = model.to(device)
+        model.eval()
     else:
-        print(f"  [Skip] Body detector not loaded (using GVHMR bboxes)")
+        _tmp_model, model_cfg = load_hamer(args.checkpoint)
+        del _tmp_model
+        torch.cuda.empty_cache()
 
-    # keypoint detector (skip if using cached wholebody keypoints)
-    cpm = None
-    vitpose_cache = None
-    if args.vitpose_cache:
-        vitpose_cache = torch.load(args.vitpose_cache, map_location='cpu', weights_only=False)
-        print(f"  [Skip] ViTPose model not loaded (using cache: {vitpose_cache.shape})")
-    else:
-        cpm = ViTPoseModel(device)
+    # ViTPose batched FP16 hand detector
+    from vitpose_model import ViTPoseModel
+    from hand_detectors import create_hand_detector
+    cpm = ViTPoseModel(str(device))
+    hand_detector = create_hand_detector(cpm=cpm, device=str(device))
 
-    # Setup the renderer
-    renderer = Renderer(model_cfg, faces=model.mano.faces)
-
-    # Make output directory if it does not exist
     os.makedirs(args.out_folder, exist_ok=True)
 
-    # Get all demo images (sorted for deterministic video-frame order)
-    img_paths = sorted([img for end in args.file_type for img in Path(args.img_folder).glob(end)])
-
-    # ── Phase 1: Detection (batched body detector + per-image keypoints) ─
-    # Load GVHMR bboxes if provided (skip ViTDet)
-    gvhmr_bboxes = None
-    if args.gvhmr_bboxes:
-        import torch as _torch
-        bbx_data = _torch.load(args.gvhmr_bboxes, map_location='cpu', weights_only=False)
-        gvhmr_bboxes = bbx_data['bbx_xyxy'].numpy()  # (L, 4)
-        print(f"Phase 1: Using GVHMR bboxes ({len(gvhmr_bboxes)} frames) — skipping ViTDet")
+    # Get frames
+    video_cap = None
+    if args.video:
+        video_cap = cv2.VideoCapture(args.video)
+        n_total = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        img_paths = [Path(f"{i:06d}.jpg") for i in range(1, n_total + 1)]
+        print(f"  [Video] {n_total} frames from {args.video}")
     else:
-        print(f"Phase 1: Detecting hands in {len(img_paths)} images "
-              f"(det_batch={args.det_batch_size}, fp16={args.fp16})...")
+        img_paths = sorted([img for end in args.file_type for img in Path(args.img_folder).glob(end)])
+        n_total = len(img_paths)
 
-    detections = []   # per-image: {img_path, n_crops}
-    all_items = []    # flat list of preprocessed crop dicts
-    item_to_det = []  # maps each crop index -> detection index
+    # ── Phase 1: Batched FP16 ViTPose hand detection ─────────────────────
+    import time as _time
+    print(f"Phase 1: ViTPose FP16 batched on {n_total} frames...")
 
-    n_total = len(img_paths)
-    det_bs = args.det_batch_size
+    if args.video:
+        t0 = _time.time()
+        video_dets = hand_detector.detect_hands_video(args.video)
+        t_detect = _time.time() - t0
+        print(f"  {n_total} frames in {t_detect:.1f}s ({n_total/t_detect:.0f} fps)")
+    else:
+        video_dets = {}
+        for frame_idx in tqdm(range(n_total), desc="Detecting"):
+            img_cv2 = cv2.imread(str(img_paths[frame_idx]))
+            dets = hand_detector.detect_hands(img_cv2)
+            if dets:
+                video_dets[frame_idx] = dets
 
-    # Auto-detect optimal detection batch size
-    if gvhmr_bboxes is None and detector is not None and torch.cuda.is_available() and n_total > 0:
-        probe_img = cv2.imread(str(img_paths[0]))
-        det_bs = _auto_det_batch_size(detector, probe_img, fp16=args.fp16)
-        del probe_img
+    hand_detector.close()
+    del cpm
+    torch.cuda.empty_cache()
 
-    for chunk_start in tqdm(range(0, n_total, det_bs), desc="Detecting",
-                            total=(n_total + det_bs - 1) // det_bs):
-        chunk_paths = img_paths[chunk_start:chunk_start+det_bs]
-        chunk_images = [cv2.imread(str(p)) for p in chunk_paths]
+    # Create ViTDetDataset crops from detections
+    detections = []
+    all_items = []
+    item_to_det = []
 
-        if gvhmr_bboxes is not None:
-            # Use GVHMR bboxes directly — one person bbox per frame
-            chunk_det_bboxes = []
-            for i, p in enumerate(chunk_paths):
-                frame_idx = chunk_start + i
-                if frame_idx < len(gvhmr_bboxes):
-                    bbox = gvhmr_bboxes[frame_idx]
-                    chunk_det_bboxes.append(np.array([[bbox[0], bbox[1], bbox[2], bbox[3], 1.0]]))
-                else:
-                    chunk_det_bboxes.append(np.zeros((0, 5)))
+    if video_cap is not None:
+        video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_idx in tqdm(range(n_total), desc="Cropping"):
+        if video_cap is not None:
+            ret, img_cv2 = video_cap.read()
+            if not ret:
+                break
         else:
-            # Batched body detection
-            chunk_det_outs = _batch_body_detect(
-                detector, chunk_images,
-                det_batch_size=det_bs, fp16=args.fp16,
-            )
-            chunk_det_bboxes = []
-            for det_out in chunk_det_outs:
-                det_instances = det_out['instances']
-                valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > 0.5)
-                pred_bboxes=det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
-                pred_scores=det_instances.scores[valid_idx].cpu().numpy()
-                chunk_det_bboxes.append(np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1))
+            img_cv2 = cv2.imread(str(img_paths[frame_idx]))
 
-        # Per-image: keypoint detection + hand bbox extraction + crop creation
-        for ci, (img_cv2, img_path, det_bboxes_scores) in enumerate(zip(chunk_images, chunk_paths, chunk_det_bboxes)):
-            img = img_cv2.copy()[:, :, ::-1]
+        hand_dets = video_dets.get(frame_idx, [])
+        if not hand_dets:
+            continue
 
-            if len(det_bboxes_scores) == 0:
-                continue
+        boxes = np.stack([d.bbox for d in hand_dets])
+        right = np.array([int(d.is_right) for d in hand_dets])
+        kp_counts = [int((d.keypoints[:, 2] > 0.5).sum()) if d.keypoints is not None else 0 for d in hand_dets]
+        kp_mean_confs = [float(d.confidence) for d in hand_dets]
 
-            # Detect human keypoints for each person
-            if vitpose_cache is not None:
-                frame_idx = chunk_start + ci
-                if frame_idx < len(vitpose_cache):
-                    cached_kps = vitpose_cache[frame_idx].numpy()  # (133, 3)
-                    vitposes_out = [{'keypoints': cached_kps}]
-                else:
-                    vitposes_out = []
-            else:
-                vitposes_out = cpm.predict_pose(
-                    img,
-                    [det_bboxes_scores],
-                )
+        dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, rescale_factor=args.rescale_factor)
+        det_idx = len(detections)
+        detections.append({
+            'img_path': img_paths[frame_idx], 'n_crops': len(dataset),
+            'kp_counts': kp_counts, 'kp_mean_confs': kp_mean_confs,
+        })
+        for i in range(len(dataset)):
+            all_items.append(dataset[i])
+            item_to_det.append(det_idx)
 
-            bboxes = []
-            is_right = []
-
-            # Use hands based on hand keypoint detections
-            for vitposes in vitposes_out:
-                left_hand_keyp = vitposes['keypoints'][-42:-21]
-                right_hand_keyp = vitposes['keypoints'][-21:]
-
-                # Rejecting not confident detections
-                keyp = left_hand_keyp
-                valid = keyp[:,2] > 0.5
-                if sum(valid) > 3:
-                    bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
-                    bboxes.append(bbox)
-                    is_right.append(0)
-                keyp = right_hand_keyp
-                valid = keyp[:,2] > 0.5
-                if sum(valid) > 3:
-                    bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
-                    bboxes.append(bbox)
-                    is_right.append(1)
-
-            if len(bboxes) == 0:
-                continue
-
-            boxes = np.stack(bboxes)
-            right = np.stack(is_right)
-
-            # Create crop dataset and extract all items
-            dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, rescale_factor=args.rescale_factor)
-            det_idx = len(detections)
-            detections.append({'img_path': img_path, 'n_crops': len(dataset)})
-
-            for i in range(len(dataset)):
-                all_items.append(dataset[i])
-                item_to_det.append(det_idx)
+    if video_cap is not None:
+        video_cap.release()
 
     n_hands = len(all_items)
-    n_images_with_hands = len(detections)
-    print(f"  Found {n_hands} hands in {n_images_with_hands}/{len(img_paths)} images")
+    print(f"  Found {n_hands} hands in {len(detections)}/{n_total} frames")
 
     if n_hands == 0:
         print("No hands detected!")
         return
 
     # ── Phase 2: Batched HaMeR inference ────────────────────────────────
+    if model is None:
+        torch.cuda.empty_cache()
+        model, _ = load_hamer(args.checkpoint)
+        model = model.to(device)
+        model.eval()
+        print(f"  [Small GPU] Loaded HaMeR after freeing ViTPose")
+
     if args.auto_batch_size and device.type == 'cuda':
         batch_size = auto_find_batch_size(model, all_items[0], device)
     else:
@@ -337,7 +212,12 @@ def main():
         _ListDataset(all_items), batch_size=batch_size, shuffle=False, num_workers=0
     )
 
-    all_results = []  # per-crop results
+    all_hand_params = {
+        "frame_idx": [], "vertices": [], "cam_t_full": [],
+        "hand_pose": [], "global_orient": [], "betas": [],
+        "is_right": [], "scaled_focal_length": [],
+        "kp_count": [], "kp_mean_conf": [],
+    }
 
     for batch in tqdm(loader, desc="HaMeR"):
         batch = recursive_to(batch, device)
@@ -352,138 +232,54 @@ def main():
         box_size = batch["box_size"].float()
         img_size = batch["img_size"].float()
 
-        # Per-sample focal length (correct for mixed-resolution batches)
         if args.focal_length > 0:
             per_sample_fl = torch.full((bs,), args.focal_length, device=pred_cam.device)
         else:
             per_sample_fl = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max(dim=1)[0]
+        from hamer.utils.renderer import cam_crop_to_full
         pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, per_sample_fl).detach().cpu().numpy()
 
+        mano_params = out['pred_mano_params']
+
         for n in range(bs):
-            verts = out['pred_vertices'][n].detach().cpu().numpy()
-            is_right_val = batch['right'][n].cpu().numpy()
+            det_idx = item_to_det[len(all_hand_params["frame_idx"])]
+            det = detections[det_idx]
+            person_id = int(batch['personid'][n])
+            img_fn = os.path.splitext(os.path.basename(det['img_path']))[0]
 
-            result = {
-                'pred_vertices': verts,
-                'pred_cam_t': out['pred_cam_t'][n].detach().cpu().numpy(),
-                'cam_t_full': pred_cam_t_full[n],
-                'is_right': is_right_val,
-                'personid': int(batch['personid'][n]),
-                'img_size': img_size[n].cpu().numpy(),
-                'scaled_focal_length': float(per_sample_fl[n]),
-            }
+            kp_count = det['kp_counts'][person_id] if person_id < len(det['kp_counts']) else 0
+            kp_conf = det['kp_mean_confs'][person_id] if person_id < len(det['kp_mean_confs']) else 0.0
 
-            # Only keep crop tensor if we need it for rendering
-            if not args.no_render:
-                result['img_crop'] = batch['img'][n].cpu()
+            all_hand_params["frame_idx"].append(int(img_fn) - 1)
+            all_hand_params["vertices"].append(out['pred_vertices'][n].detach().cpu().numpy())
+            all_hand_params["cam_t_full"].append(pred_cam_t_full[n])
+            all_hand_params["hand_pose"].append(mano_params['hand_pose'][n].detach().cpu().numpy())
+            all_hand_params["global_orient"].append(mano_params['global_orient'][n].detach().cpu().numpy())
+            all_hand_params["betas"].append(mano_params['betas'][n].detach().cpu().numpy())
+            all_hand_params["is_right"].append(batch['right'][n].cpu().numpy())
+            all_hand_params["scaled_focal_length"].append(float(per_sample_fl[n]))
+            all_hand_params["kp_count"].append(kp_count)
+            all_hand_params["kp_mean_conf"].append(kp_conf)
 
-            if args.save_params:
-                mano_params = out['pred_mano_params']
-                result['hand_pose'] = mano_params['hand_pose'][n].detach().cpu().numpy()
-                result['global_orient'] = mano_params['global_orient'][n].detach().cpu().numpy()
-                result['betas'] = mano_params['betas'][n].detach().cpu().numpy()
-                result['pred_keypoints_3d'] = out['pred_keypoints_3d'][n].detach().cpu().numpy()
-
-            all_results.append(result)
-
-    # ── Phase 3: Save params / meshes / render ──────────────────────────
-    print(f"Phase 3: Saving results...")
-
-    # Group results by detection (image) index
-    det_results = defaultdict(list)
-    for res_idx, det_idx in enumerate(item_to_det):
-        det_results[det_idx].append(all_results[res_idx])
-
-    for det_idx, det in enumerate(tqdm(detections, desc="Saving")):
-        img_path = det['img_path']
-        img_fn = os.path.splitext(os.path.basename(img_path))[0]
-        results = det_results[det_idx]
-
-        all_verts = []
-        all_cam_t = []
-        all_right_list = []
-
-        for r in results:
-            person_id = r['personid']
-            verts = r['pred_vertices']
-            is_right_val = r['is_right']
-            cam_t = r['cam_t_full']
-
-            # Per-crop rendering
-            if not args.no_render:
-                white_img = (torch.ones_like(r['img_crop']) - DEFAULT_MEAN[:,None,None]/255) / (DEFAULT_STD[:,None,None]/255)
-                input_patch = r['img_crop'] * (DEFAULT_STD[:,None,None]/255) + (DEFAULT_MEAN[:,None,None]/255)
-                input_patch = input_patch.permute(1,2,0).numpy()
-
-                regression_img = renderer(verts,
-                                        r['pred_cam_t'],
-                                        r['img_crop'],
-                                        mesh_base_color=LIGHT_BLUE,
-                                        scene_bg_color=(1, 1, 1),
-                                        )
-
-                if args.side_view:
-                    side_img = renderer(verts,
-                                            r['pred_cam_t'],
-                                            white_img,
-                                            mesh_base_color=LIGHT_BLUE,
-                                            scene_bg_color=(1, 1, 1),
-                                            side_view=True)
-                    final_img = np.concatenate([input_patch, regression_img, side_img], axis=1)
-                else:
-                    final_img = np.concatenate([input_patch, regression_img], axis=1)
-
-                cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_{person_id}.png'), 255*final_img[:, :, ::-1])
-
-            # Collect for full-frame rendering
-            verts_ff = verts.copy()
-            verts_ff[:,0] = (2*is_right_val-1)*verts_ff[:,0]
-            all_verts.append(verts_ff)
-            all_cam_t.append(cam_t)
-            all_right_list.append(is_right_val)
-
-            # Save meshes to disk
-            if args.save_mesh:
-                camera_translation = cam_t.copy()
-                tmesh = renderer.vertices_to_trimesh(verts_ff, camera_translation, LIGHT_BLUE, is_right=is_right_val)
-                tmesh.export(os.path.join(args.out_folder, f'{img_fn}_{person_id}.obj'))
-
-            # Save MANO params
-            if args.save_params:
-                params_dir = os.path.join(args.out_folder, 'mano_params')
-                os.makedirs(params_dir, exist_ok=True)
-                np.savez(
-                    os.path.join(params_dir, f'{img_fn}_{person_id}.npz'),
-                    hand_pose=r['hand_pose'],
-                    global_orient=r['global_orient'],
-                    betas=r['betas'],
-                    vertices=verts,
-                    keypoints_3d=r['pred_keypoints_3d'],
-                    cam_t_full=cam_t,
-                    is_right=is_right_val,
-                    img_fn=img_fn,
-                    scaled_focal_length=r['scaled_focal_length'],
-                )
-
-        # Render front view (full frame with all hands overlaid)
-        if not args.no_render and args.full_frame and len(all_verts) > 0:
-            misc_args = dict(
-                mesh_base_color=LIGHT_BLUE,
-                scene_bg_color=(1, 1, 1),
-                focal_length=results[0]['scaled_focal_length'],
-            )
-            img_size_tensor = torch.tensor(results[0]['img_size'])
-            cam_view = renderer.render_rgba_multiple(all_verts, cam_t=all_cam_t, render_res=img_size_tensor, is_right=all_right_list, **misc_args)
-
-            # Overlay image
-            img_cv2 = cv2.imread(str(img_path))
-            input_img = img_cv2.astype(np.float32)[:,:,::-1]/255.0
-            input_img = np.concatenate([input_img, np.ones_like(input_img[:,:,:1])], axis=2) # Add alpha channel
-            input_img_overlay = input_img[:,:,:3] * (1-cam_view[:,:,3:]) + cam_view[:,:,:3] * cam_view[:,:,3:]
-
-            cv2.imwrite(os.path.join(args.out_folder, f'{img_fn}_all.jpg'), 255*input_img_overlay[:, :, ::-1])
-
-    print("Done!")
+    # Save consolidated output
+    if len(all_hand_params["frame_idx"]) > 0:
+        consolidated = {
+            "frame_idx": torch.tensor(all_hand_params["frame_idx"], dtype=torch.long),
+            "vertices": torch.tensor(np.stack(all_hand_params["vertices"]), dtype=torch.float32),
+            "cam_t_full": torch.tensor(np.stack(all_hand_params["cam_t_full"]), dtype=torch.float32),
+            "hand_pose": torch.tensor(np.stack(all_hand_params["hand_pose"]), dtype=torch.float32),
+            "global_orient": torch.tensor(np.stack(all_hand_params["global_orient"]), dtype=torch.float32),
+            "betas": torch.tensor(np.stack(all_hand_params["betas"]), dtype=torch.float32),
+            "is_right": torch.tensor(np.array(all_hand_params["is_right"], dtype=bool)),
+            "scaled_focal_length": torch.tensor(np.array(all_hand_params["scaled_focal_length"], dtype=np.float32)),
+            "kp_count": torch.tensor(np.array(all_hand_params["kp_count"], dtype=np.int64)),
+            "kp_mean_conf": torch.tensor(np.array(all_hand_params["kp_mean_conf"], dtype=np.float32)),
+        }
+        pt_path = os.path.join(args.out_folder, "hamer_hands.pt")
+        torch.save(consolidated, pt_path)
+        print(f"  Saved {len(all_hand_params['frame_idx'])} hand detections -> {pt_path}")
+    else:
+        print("No hands detected!")
 
 if __name__ == '__main__':
     main()
