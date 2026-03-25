@@ -105,9 +105,15 @@ def main():
         model = model.to(device)
         model.eval()
     else:
-        _tmp_model, model_cfg = load_hamer(args.checkpoint)
-        del _tmp_model
-        torch.cuda.empty_cache()
+        # Only load config (not the model) to save GPU memory for ViTPose
+        from pathlib import Path as _P
+        from hamer.configs import get_config
+        _cfg_path = str(_P(args.checkpoint).parent.parent / 'model_config.yaml')
+        model_cfg = get_config(_cfg_path, update_cachedir=True)
+        if model_cfg.MODEL.BACKBONE.TYPE == 'vit' and 'BBOX_SHAPE' not in model_cfg.MODEL:
+            model_cfg.defrost()
+            model_cfg.MODEL.BBOX_SHAPE = [192, 256]
+            model_cfg.freeze()
 
     # ViTPose batched FP16 hand detector
     from vitpose_model import ViTPoseModel
@@ -195,10 +201,11 @@ def main():
 
     # ── Phase 2: Batched HaMeR inference ────────────────────────────────
     if model is None:
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
         model, _ = load_hamer(args.checkpoint)
-        model = model.to(device)
-        model.eval()
+        model = model.to(device).eval()
         print(f"  [Small GPU] Loaded HaMeR after freeing ViTPose")
 
     if args.auto_batch_size and device.type == 'cuda':

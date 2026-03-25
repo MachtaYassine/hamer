@@ -48,5 +48,5 @@ def load_hamer(checkpoint_path=DEFAULT_CHECKPOINT):
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
 
-    model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+    model = HAMER.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg, map_location='cpu')
     return model, model_cfg
