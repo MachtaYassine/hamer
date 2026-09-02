@@ -78,6 +78,10 @@ def main():
     parser.add_argument('--no_auto_batch_size', action='store_false', dest='auto_batch_size')
     parser.add_argument('--focal_length', type=float, default=0,
                         help='Override focal length for cam_t_full (0=use default HaMeR focal)')
+    parser.add_argument('--frame_stride', type=int, default=1,
+                        help='Source-frame stride used when extracting img_folder. Frames are '
+                             'renumbered 1..N by ffmpeg but correspond to source frames '
+                             '0,stride,2*stride,... — without this, hands land on the wrong frames.')
     parser.add_argument('--video', type=str, default='',
                         help='Read frames from video directly (skip frame extraction to disk)')
 
@@ -140,9 +144,11 @@ def main():
 
     if args.video:
         t0 = _time.time()
-        video_dets = hand_detector.detect_hands_video(args.video)
+        video_dets = hand_detector.detect_hands_video(args.video, stride=args.frame_stride)
         t_detect = _time.time() - t0
-        print(f"  {n_total} frames in {t_detect:.1f}s ({n_total/t_detect:.0f} fps)")
+        n_seen = (n_total + args.frame_stride - 1) // args.frame_stride
+        print(f"  {n_seen}/{n_total} frames (stride={args.frame_stride}) in {t_detect:.1f}s "
+              f"({n_seen/t_detect:.0f} fps)")
     else:
         video_dets = {}
         for frame_idx in tqdm(range(n_total), desc="Detecting"):
@@ -163,16 +169,21 @@ def main():
     if video_cap is not None:
         video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     for frame_idx in tqdm(range(n_total), desc="Cropping"):
+        hand_dets = video_dets.get(frame_idx, [])
         if video_cap is not None:
-            ret, img_cv2 = video_cap.read()
+            # grab() advances the decoder cheaply; only retrieve() (decode->BGR) the
+            # frames that actually have detections. With stride>1 most are skipped.
+            if not video_cap.grab():
+                break
+            if not hand_dets:
+                continue
+            ret, img_cv2 = video_cap.retrieve()
             if not ret:
                 break
         else:
+            if not hand_dets:
+                continue
             img_cv2 = cv2.imread(str(img_paths[frame_idx]))
-
-        hand_dets = video_dets.get(frame_idx, [])
-        if not hand_dets:
-            continue
 
         boxes = np.stack([d.bbox for d in hand_dets])
         right = np.array([int(d.is_right) for d in hand_dets])

@@ -19,7 +19,12 @@ class ViTPoseHandDetector(HandDetector):
         device: str = "cuda",
         batch_size: int = 16,
         min_keypoint_confidence: float = 0.5,
-        min_valid_keypoints: int = 3,
+        # Must match scripts/utils.py MIN_KP_COUNT (7): the merge discards any hand
+        # with fewer than 7 keypoints above 0.5 conf, so detecting at >3 meant running
+        # the ViT-H mesh model on hands that were then thrown away — measured 9.7% of
+        # all HaMeR inferences across 57 clips. Both stages count the same quantity
+        # (keypoints with conf > 0.5), so this changes cost, not output.
+        min_valid_keypoints: int = 7,
     ):
         self.device = device
         self.batch_size = batch_size
@@ -37,49 +42,72 @@ class ViTPoseHandDetector(HandDetector):
     def detect_hands(self, img_bgr: np.ndarray) -> list[HandDetection]:
         raise NotImplementedError("Use detect_hands_video for batched processing")
 
-    def detect_hands_video(self, video_path: str):
-        """Detect hands in all frames of a video.
+    def detect_hands_video(self, video_path: str, stride: int = 1):
+        """Detect hands in a video, optionally on every `stride`-th frame.
+
+        Keys of the returned dict are always TRUE source frame indices
+        (0, stride, 2*stride, ...), never positions within the subsampled set —
+        callers map detections back onto the full-length sequence.
 
         Returns:
-            dict[int, list[HandDetection]]: frame_idx -> detections.
+            dict[int, list[HandDetection]]: source_frame_idx -> detections.
         """
         W, H = self._img_size
         BS = self.batch_size
 
-        cap = cv2.VideoCapture(video_path)
-        all_crops = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            resized = cv2.resize(frame[:, :, ::-1], (W, H))
-            normalized = (resized / 255.0 - self._mean) / self._std
-            all_crops.append(torch.from_numpy(normalized.transpose(2, 0, 1)).float())
-        cap.release()
-
-        n_frames = len(all_crops)
-        if n_frames == 0:
-            return {}
-
-        # Batched FP16 forward
+        # Streaming: forward each batch as soon as it is full and drop the pixels.
+        # Buffering the whole video first cost ~590KB/frame -> ~21GB on a 35k-frame
+        # clip, purely to feed batches of ~100. Only the (vals, idx) outputs are kept,
+        # which are 133 floats per frame. Peak now scales with BS, not video length.
         all_max_vals = []
         all_max_idx = []
-        Hh, Hw = None, None
-        for i in range(0, n_frames, BS):
-            batch = torch.stack(all_crops[i:i + BS]).to(self.device)
+        shape_hw = []
+
+        def _forward(buf):
+            batch = torch.stack(buf).to(self.device)
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
                 out = self._backbone(batch)
                 if isinstance(out, (list, tuple)):
                     out = out[-1]
                 hm = self._head(out).float().cpu()
-            _, n_kps, Hh, Hw = hm.shape
+            _, n_kps, hh, hw = hm.shape
+            if not shape_hw:
+                shape_hw.extend([hh, hw])
             flat = hm.view(hm.shape[0], n_kps, -1)
             vals, idx = flat.max(dim=2)
             all_max_vals.append(vals)
             all_max_idx.append(idx)
             del batch, out, hm
 
-        del all_crops
+        cap = cv2.VideoCapture(video_path)
+        buf = []
+        src_idx = []          # true source index of each kept crop
+        i = 0
+        while True:
+            # grab() decodes without converting; only retrieve() the frames we keep
+            if not cap.grab():
+                break
+            if i % stride == 0:
+                ret, frame = cap.retrieve()
+                if not ret:
+                    break
+                resized = cv2.resize(frame[:, :, ::-1], (W, H))
+                normalized = (resized / 255.0 - self._mean) / self._std
+                buf.append(torch.from_numpy(normalized.transpose(2, 0, 1)).float())
+                src_idx.append(i)
+                if len(buf) >= BS:
+                    _forward(buf)
+                    buf = []
+            i += 1
+        cap.release()
+        if buf:
+            _forward(buf)
+
+        n_frames = len(src_idx)
+        if n_frames == 0:
+            return {}
+
+        Hh, Hw = shape_hw
 
         max_vals = torch.cat(all_max_vals, dim=0)
         max_idx = torch.cat(all_max_idx, dim=0)
@@ -106,7 +134,7 @@ class ViTPoseHandDetector(HandDetector):
 
             detections = self._extract_hands(kps_all)
             if detections:
-                results[fi] = detections
+                results[src_idx[fi]] = detections   # key by TRUE source frame
 
         return results
 
@@ -114,7 +142,7 @@ class ViTPoseHandDetector(HandDetector):
         detections = []
         for hand_kps, is_right in [(kps_all[-42:-21], False), (kps_all[-21:], True)]:
             valid = hand_kps[:, 2] > self.min_conf
-            if int(valid.sum()) <= self.min_valid:
+            if int(valid.sum()) < self.min_valid:   # keep iff >= min_valid (7)
                 continue
             kps_valid = hand_kps[valid]
             bbox = np.array([
