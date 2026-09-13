@@ -28,42 +28,19 @@ class _ListDataset(torch.utils.data.Dataset):
 
 
 def auto_find_batch_size(model, sample_item, device, target_util=0.85):
-    """Two-probe GPU memory estimation: bs=1 (fixed overhead) then bs=4 (marginal cost)."""
+    """Two-probe GPU memory estimation, via the one shared heuristic."""
     import gc
+    from hmr4d.utils.auto_batch import auto_batch_size
+
+    def probe(n):
+        loader = torch.utils.data.DataLoader(_ListDataset([sample_item] * n), batch_size=n)
+        return model(recursive_to(next(iter(loader)), device))
+
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-
-    loader1 = torch.utils.data.DataLoader(_ListDataset([sample_item]), batch_size=1)
-    batch1 = recursive_to(next(iter(loader1)), device)
-    with torch.no_grad():
-        _ = model(batch1)
-    peak1 = torch.cuda.max_memory_allocated(device)
-    del batch1, _, loader1
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-
-    test_bs = 4
-    loader4 = torch.utils.data.DataLoader(_ListDataset([sample_item] * test_bs), batch_size=test_bs)
-    batch4 = recursive_to(next(iter(loader4)), device)
-    with torch.no_grad():
-        _ = model(batch4)
-    peak4 = torch.cuda.max_memory_allocated(device)
-    per_sample = (peak4 - peak1) / (test_bs - 1)
-    del batch4, _, loader4
-    torch.cuda.empty_cache()
-
-    total = torch.cuda.get_device_properties(device).total_memory
-    if total < 12e9:
-        target_util = 0.65
-    available = total * target_util - peak1
-    optimal = max(1, min(256, int(available / max(per_sample, 1))))
-    if total < 12e9:
-        optimal = max(1, optimal // 2)
-
-    print(f"  [Auto BS] GPU: {total/1e9:.1f}GB total, fixed: {peak1/1e6:.0f}MB, "
-          f"per_sample: {per_sample/1e6:.0f}MB -> batch_size={optimal}")
-    return optimal
+    return auto_batch_size(
+        probe, label="HaMeR", cap=256, device=device,
+        target_util=target_util, small_gpu_target_util=0.65,
+    )
 
 
 def main():
